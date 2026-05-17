@@ -1,0 +1,172 @@
+import asyncio
+import os
+import re
+import time
+import random
+from collections import defaultdict
+from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError
+from telethon.sessions import StringSession
+
+# ====== الإعدادات الأساسية ======
+API_ID = 31056496
+API_HASH = "e5c22075ca0cc6fff9f439e211a091b4"
+FILE_PATH = "مستند نصي جديد.txt"
+STRING_SESSION = ""
+
+# تهيئة الجلسة
+if STRING_SESSION:
+    client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+else:
+    client = TelegramClient("me", API_ID, API_HASH)
+
+# جعل المكتبة تمتص الفلود القصير جداً (أقل من 10 ثوانٍ) تلقائياً، وتترك الفلود الطويل ليعالجه كودنا الذكي
+client.flood_sleep_threshold = 10
+
+# ====== نظام الـ RATE LIMIT (TOKEN BUCKET) ======
+class TokenBucket:
+    def __init__(self, rate, capacity):
+        self.rate = rate          # معدل توليد التذاكر في الثانية
+        self.capacity = capacity  # أقصى عدد تذاكر يمكن تخزينه للسيرفر الواحد
+        self.tokens = capacity    # الرصيد الحالي من التذاكر
+        self.updated = time.time()
+
+    def consume(self, amount=1):
+        now = time.time()
+        # إضافة تذاكر جديدة بناءً على الوقت الذي مر
+        self.tokens = min(self.capacity,
+                          self.tokens + (now - self.updated) * self.rate)
+        self.updated = now
+
+        if self.tokens >= amount:
+            self.tokens -= amount
+            return True
+        return False
+
+# سلة تذاكر منفصلة لكل مجموعة (تمنع تأثر باقي المجموعات بسبام مجموعة واحدة)
+buckets = defaultdict(lambda: TokenBucket(rate=0.7, capacity=3))
+cooldowns = defaultdict(float)
+
+# ====== تنظيف النصوص والتشكيل ======
+def normalize_text(text):
+    if not text:
+        return ""
+    text = text.lower()
+    text = re.sub(r"[\u064B-\u0652]", "", text)  # إزالة التشكيل
+    text = re.sub(r"ـ+", "", text)               # إزالة التطويل
+    text = re.sub(r"[^\w\s\u0600-\u06FF]", " ", text) # تنظيف الرموز
+    return " ".join(text.split())
+
+# ====== نظام الكلمات والردود ======
+words = {}
+pattern = None
+
+def load_patterns():
+    global words, pattern
+
+    if not os.path.exists(FILE_PATH):
+        with open(FILE_PATH, "w", encoding="utf-8") as f:
+            f.write("هلا -> أهلاً بك\nسلام -> وعليكم السلام\n")
+        return
+
+    data = {}
+    try:
+        with open(FILE_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                if " -> " in line:
+                    k, v = line.split(" -> ", 1)
+                elif "->" in line:
+                    k, v = line.split("->", 1)
+                else:
+                    continue
+                
+                k_norm = normalize_text(k.strip())
+                v_trim = v.strip()
+                if k_norm and v_trim:
+                    data[k_norm] = v_trim
+
+        words = data
+        if words:
+            # ترتيب الكلمات من الأطول للأقصر لحماية الفحص الصارم
+            keys = sorted(words.keys(), key=len, reverse=True)
+            pattern = re.compile("|".join(map(re.escape, keys)))
+            print(f"🔄 Loaded {len(words)} replies successfully.")
+    except Exception as e:
+        print(f"Error loading file: {e}")
+
+# ====== المرسل الذكي الخارق ======
+async def send_smart(chat_id, text, reply_to):
+    while True:
+        now = time.time()
+
+        # إذا كانت المجموعة تحت فترة Cooldown (حظر مؤقت) نتوقف حتى تنتهي
+        if now < cooldowns[chat_id]:
+            await asyncio.sleep(cooldowns[chat_id] - now)
+            continue
+
+        bucket = buckets[chat_id]
+
+        # محاولة استهلاك تذكرة لإرسال الرسالة
+        if bucket.consume():
+            try:
+                await client.send_message(chat_id, text, reply_to=reply_to)
+                print(f"✅ Sent response to chat {chat_id}")
+                return  # الخروج بنجاح بعد الإرسال
+
+            except FloodWaitError as e:
+                # إذا واجهنا فلود طويل (أكثر من ساعة) نتخطى الرسالة فوراً حماية للحساب
+                if e.seconds > 3600:
+                    print(f"🚨 Extreme FloodWait ({e.seconds}s). Skipping message to protect account.")
+                    return
+                
+                # تحويل الفلود إلى فترة Cooldown للمجموعة المستهدفة + إضافة وقت عشوائي (Jitter)
+                jitter = random.randint(2, 6)
+                cooldowns[chat_id] = time.time() + e.seconds + jitter
+                print(f"⛔ Telegram FloodWait! Chat {chat_id} locked for {e.seconds} + {jitter}s Jitter.")
+                await asyncio.sleep(e.seconds + jitter)
+
+            except Exception as e:
+                print(f"⚠️ Sending Error: {e}")
+                await asyncio.sleep(2)  # انتظام خفيف عند الأخطاء العادية
+
+        else:
+            # إذا نفدت التذاكر بالمجموعة -> انتظار ذكي ديناميكي متذبذب لإرباك الـ Bot Detection الخاص بتليجرام
+            await asyncio.sleep(0.6 + random.random())
+
+# ====== مستمع الرسائل ======
+@client.on(events.NewMessage(incoming=True))
+async def handler(event):
+    # الفلترة الصارمة (مجموعات + تحتوي نص + منشن للبوت فقط) لتقليل الضغط على السيرفر لأقصى درجة
+    if not event.is_group or not event.text or not event.mentioned:
+        return
+
+    text = normalize_text(event.text)
+
+    if not pattern:
+        return
+
+    match = pattern.search(text)
+    if match:
+        key = match.group().strip()
+
+        if key in words:
+            # إطلاق عملية الإرسال كمهمة منفصلة فوراً في الخلفية حتى لا يتوقف السيرفر
+            asyncio.create_task(
+                send_smart(event.chat_id, words[key], event.id)
+            )
+
+# ====== التحديث التلقائي للملف ======
+async def reload_loop():
+    while True:
+        await asyncio.sleep(15)  # فحص التعديلات كل 15 ثانية
+        load_patterns()
+
+# ====== التشغيل الأساسي ======
+async def main():
+    load_patterns()
+    asyncio.create_task(reload_loop())
+    print("🚀 ULTRA ANTI-FLOOD BOT RUNNING ON SERVER (Mention Only Mode) 😈")
+    await client.run_until_disconnected()
+
+with client:
+    client.loop.run_until_complete(main())
